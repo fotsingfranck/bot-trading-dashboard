@@ -12,8 +12,13 @@ app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-key-change-in-prod")
 
 DB_PATH = os.environ.get("SQLITE_DB_PATH", "trading.db")
 SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
+COINGECKO_MAP = {
+    "bitcoin": "BTC/USDT",
+    "ethereum": "ETH/USDT",
+    "solana": "SOL/USDT",
+    "binancecoin": "BNB/USDT",
+}
 
-# Configuration de synchronisation vers MySQL LWS via api_db.php
 LWS_API_URL = os.environ.get("LWS_API_URL", "https://kingpronos.net/trading/api_db.php").strip()
 LWS_SYNC_TOKEN = os.environ.get("LWS_SYNC_TOKEN", "").strip()
 
@@ -61,7 +66,6 @@ def init_db():
             )
             """
         )
-        # Migration douce si la colonne remote_id n'existait pas encore
         cur.execute("PRAGMA table_info(cycles)")
         columns = [row[1] for row in cur.fetchall()]
         if "remote_id" not in columns:
@@ -70,11 +74,11 @@ def init_db():
 
 
 def sync_to_lws(payload: dict):
-    """Envoie un événement (ouverture/clôture de cycle) vers api_db.php sur LWS."""
+    """Envoie un événement vers api_db.php sur LWS."""
     if not LWS_API_URL or not LWS_SYNC_TOKEN:
         with state_lock:
-            bot_state["lws_sync_status"] = "Non configuré (LWS_API_URL / LWS_SYNC_TOKEN)"
-        return None
+            bot_state["lws_sync_status"] = "Non configuré"
+        return {"ok": False, "error": "LWS_API_URL ou LWS_SYNC_TOKEN manquant"}
 
     body = dict(payload)
     body["token"] = LWS_SYNC_TOKEN
@@ -83,6 +87,10 @@ def sync_to_lws(payload: dict):
         resp = requests.post(LWS_API_URL, json=body, timeout=10)
         resp.raise_for_status()
         data = resp.json() if resp.content else {}
+        if data.get("error"):
+            with state_lock:
+                bot_state["lws_sync_status"] = f"Erreur PHP: {data.get('error')}"
+            return data
         with state_lock:
             bot_state["lws_sync_status"] = f"OK ({datetime.now().strftime('%H:%M:%S')})"
         return data
@@ -90,47 +98,36 @@ def sync_to_lws(payload: dict):
         with state_lock:
             bot_state["lws_sync_status"] = f"Erreur: {e}"
         print(f"[SYNC LWS ERREUR] {e}", flush=True)
-        return None
+        return {"ok": False, "error": str(e)}
 
 
 def fetch_lws_trades():
     """Récupère les derniers trades depuis MySQL LWS si configuré."""
-    if not LWS_API_URL or not LWS_SYNC_TOKEN:
-        return None
-    try:
-        resp = requests.post(
-            LWS_API_URL,
-            json={"token": LWS_SYNC_TOKEN, "action": "list_trades"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("ok") and isinstance(data.get("trades"), list):
-            formatted = []
-            for row in data["trades"]:
-                formatted.append(
-                    {
-                        "id": row.get("id"),
-                        "date_cycle": row.get("date_cycle"),
-                        "mode": row.get("mode"),
-                        "paire": row.get("paire"),
-                        "prix_entree": row.get("prix_entree"),
-                        "prix_sortie": row.get("prix_sortie"),
-                        "quantite": row.get("quantite"),
-                        "profit_usdt": row.get("profit_usdt"),
-                        "statut": row.get("statut"),
-                    }
-                )
-            return formatted
-    except Exception as e:
-        print(f"[LIST LWS ERREUR] {e}", flush=True)
+    res = sync_to_lws({"action": "list_trades"})
+    if isinstance(res, dict) and res.get("ok") and isinstance(res.get("trades"), list):
+        formatted = []
+        for row in res["trades"]:
+            formatted.append(
+                {
+                    "id": row.get("id"),
+                    "date_cycle": row.get("date_cycle"),
+                    "mode": row.get("mode"),
+                    "paire": row.get("paire"),
+                    "prix_entree": row.get("prix_entree"),
+                    "prix_sortie": row.get("prix_sortie"),
+                    "quantite": row.get("quantite"),
+                    "profit_usdt": row.get("profit_usdt"),
+                    "statut": row.get("statut"),
+                }
+            )
+        return formatted
     return None
 
 
 def get_exchange(api_key="", api_secret=""):
     opts = {
         "enableRateLimit": True,
-        "timeout": 12000,
+        "timeout": 10000,
     }
     if api_key and api_secret:
         opts["apiKey"] = api_key
@@ -148,8 +145,25 @@ def compute_signal(change_pct: float) -> str:
     return "NEUTRE"
 
 
+def fetch_market_coingecko():
+    """Repli public via CoinGecko si Binance est indisponible ou bloqué sur Render."""
+    ids = ",".join(COINGECKO_MAP.keys())
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd&include_24hr_change=true"
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
+    payload = resp.json()
+    out = {}
+    for cg_id, sym in COINGECKO_MAP.items():
+        item = payload.get(cg_id)
+        if item and item.get("usd") is not None:
+            price = float(item["usd"])
+            pct = float(item.get("usd_24h_change") or 0.0)
+            out[sym] = (price, pct)
+    return out
+
+
 def fetch_market_snapshot(exchange):
-    """Récupère les tickers des paires de façon résiliente (batch puis repli par paire)."""
+    """Récupère les tickers via CCXT Binance, avec repli automatique CoinGecko si nécessaire."""
     results = {}
     errors = []
 
@@ -163,9 +177,8 @@ def fetch_market_snapshot(exchange):
                     pct = float(t["percentage"]) if t.get("percentage") is not None else 0.0
                     results[sym] = (price, pct)
     except Exception as e:
-        errors.append(f"fetch_tickers: {e}")
+        errors.append(f"Binance: {e}")
 
-    # Compléter les paires manquantes individuellement
     for sym in SYMBOLS:
         if sym in results:
             continue
@@ -177,6 +190,15 @@ def fetch_market_snapshot(exchange):
                 results[sym] = (price, pct)
         except Exception as e:
             errors.append(f"{sym}: {e}")
+
+    if not results:
+        try:
+            cg_data = fetch_market_coingecko()
+            if cg_data:
+                results.update(cg_data)
+                errors = [f"Repli CoinGecko actif ({'; '.join(errors)})"] if errors else []
+        except Exception as cg_err:
+            errors.append(f"CoinGecko: {cg_err}")
 
     return results, errors
 
@@ -216,7 +238,6 @@ def process_trading_logic(snapshot: dict, now_str: str):
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
-        # 1. Clôturer les positions ouvertes si profit >= +0.8% ou perte <= -0.6%
         cur.execute("SELECT * FROM cycles WHERE statut = 'OUVERT'")
         open_trades = cur.fetchall()
 
@@ -263,7 +284,6 @@ def process_trading_logic(snapshot: dict, now_str: str):
                         }
                     )
 
-        # 2. Ouvrir une nouvelle position si ACHAT FORT et aucune position déjà ouverte sur la paire
         for sym, (price, pct) in snapshot.items():
             if compute_signal(pct) != "ACHAT FORT" or price <= 0:
                 continue
@@ -305,7 +325,7 @@ def process_trading_logic(snapshot: dict, now_str: str):
                         "statut": "OUVERT",
                     }
                 )
-                if lws_res and lws_res.get("id"):
+                if isinstance(lws_res, dict) and lws_res.get("id"):
                     cur.execute(
                         "UPDATE cycles SET remote_id = ? WHERE id = ?",
                         (int(lws_res["id"]), local_id),
@@ -341,7 +361,7 @@ def process_trading_logic(snapshot: dict, now_str: str):
                             "statut": "OUVERT",
                         }
                     )
-                    if lws_res and lws_res.get("id"):
+                    if isinstance(lws_res, dict) and lws_res.get("id"):
                         cur.execute(
                             "UPDATE cycles SET remote_id = ? WHERE id = ?",
                             (int(lws_res["id"]), local_id),
@@ -354,7 +374,9 @@ def process_trading_logic(snapshot: dict, now_str: str):
         conn.commit()
 
 
-def run_single_cycle(exchange):
+def run_single_cycle(exchange=None):
+    if exchange is None:
+        exchange = get_exchange()
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     snapshot, errors = fetch_market_snapshot(exchange)
 
@@ -371,12 +393,12 @@ def bot_loop():
     init_db()
     exchange = get_exchange()
 
-    # Premier scan immédiat au démarrage pour ne pas attendre 20s à vide
     try:
         run_single_cycle(exchange)
     except Exception as e:
         with state_lock:
             bot_state["last_error"] = str(e)
+            bot_state["last_scan"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[ERREUR BOT INIT] {e}", flush=True)
 
     while True:
@@ -389,7 +411,6 @@ def bot_loop():
             print(f"[ERREUR BOT] {e}", flush=True)
 
 
-# Démarrer la boucle en arrière-plan dès le chargement du module (compatible Gunicorn)
 _thread_started = False
 _thread_lock = threading.Lock()
 
@@ -398,12 +419,15 @@ def ensure_background_bot():
     global _thread_started
     with _thread_lock:
         if not _thread_started:
+            init_db()
             t = threading.Thread(target=bot_loop, daemon=True, name="TradingBotThread")
             t.start()
             _thread_started = True
 
 
-ensure_background_bot()
+@app.before_request
+def _before_any_request():
+    ensure_background_bot()
 
 
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -420,7 +444,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }
     .brand { display: flex; align-items: center; gap: 12px; }
     .brand h1 { margin: 0; font-size: 24px; }
-    .meta-bar { font-size: 12px; color: #475569; display: flex; gap: 14px; flex-wrap: wrap; }
+    .meta-bar { font-size: 12px; color: #475569; display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
     .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-bottom: 18px; }
     .card { border: 1px solid #e2e8f0; border-left: 4px solid #2563eb; border-radius: 8px; padding: 14px; background: #f8fafc; }
     .card-title { font-size: 13px; font-weight: 700; color: #334155; margin-bottom: 8px; }
@@ -430,6 +454,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .badge-on { background: #16a34a; }
     .badge-off { background: #64748b; }
     button { border: none; border-radius: 6px; padding: 8px 14px; font-weight: 600; cursor: pointer; font-size: 13px; }
+    .btn-sm { padding: 5px 10px; font-size: 12px; }
     .btn-red { background: #dc2626; color: #fff; }
     .btn-green { background: #16a34a; color: #fff; }
     .btn-dark { background: #1e293b; color: #fff; }
@@ -441,6 +466,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     th, td { border-bottom: 1px solid #e2e8f0; padding: 10px 12px; text-align: left; }
     th { background: #f1f5f9; font-weight: 700; color: #1e293b; }
     .err-banner { background: #fef2f2; border: 1px solid #fecaca; color: #991b1b; padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 14px; display: none; }
+    .info-banner { background: #eff6ff; border: 1px solid #bfdbfe; color: #1e3a8a; padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 14px; display: none; }
     .pos { color: #15803d; font-weight: 700; }
     .neg { color: #b91c1c; font-weight: 700; }
   </style>
@@ -459,9 +485,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="meta-bar">
         <span id="lastScan">Dernier scan : --</span>
         <span id="lwsStatus">MySQL LWS : --</span>
+        <button class="btn-dark btn-sm" onclick="testLws()">Tester MySQL LWS</button>
       </div>
     </div>
 
+    <div id="infoBanner" class="info-banner"></div>
     <div id="errBanner" class="err-banner"></div>
 
     <div class="grid-4">
@@ -612,6 +640,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       }
     }
 
+    async function testLws() {
+      const infoBanner = document.getElementById('infoBanner');
+      infoBanner.style.display = 'block';
+      infoBanner.textContent = 'Test de connexion vers MySQL LWS en cours...';
+      try {
+        const res = await fetch('/api/test-lws');
+        const data = await res.json();
+        infoBanner.textContent = 'Réponse MySQL LWS : ' + JSON.stringify(data);
+      } catch (e) {
+        infoBanner.textContent = 'Erreur test LWS : ' + e;
+      }
+      refreshStatus();
+    }
+
     async function toggleMode() {
       await fetch('/api/mode', { method: 'POST' });
       refreshStatus();
@@ -649,6 +691,12 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 
+@app.route("/api/test-lws")
+def api_test_lws():
+    res = sync_to_lws({"action": "list_trades"})
+    return jsonify(res)
+
+
 @app.route("/api/status")
 def api_status():
     ensure_background_bot()
@@ -669,7 +717,6 @@ def api_status():
         cur.execute("SELECT * FROM cycles ORDER BY id DESC LIMIT 100")
         local_cycles = [dict(r) for r in cur.fetchall()]
 
-    # Si l'historique local est vide mais MySQL LWS a des trades, on affiche ceux de LWS
     lws_cycles = fetch_lws_trades() if not local_cycles else None
     cycles_to_show = lws_cycles if (lws_cycles is not None and len(lws_cycles) > 0) else local_cycles
 
