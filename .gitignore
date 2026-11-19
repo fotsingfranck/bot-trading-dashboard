@@ -1,19 +1,8 @@
-# Secrets et variables d'environnement
 .env
-*.local
-
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-venv/
-.venv/
-
-# Node.js / dépendances
-node_modules/
-
-# Bases locales / logs / fichiers temporaires
 *.db
 *.sqlite
 *.sqlite3
-*.log
+__pycache__/
+*.py[cod]
+venv/
+.venv/
